@@ -39,12 +39,97 @@
   function save() {
     try { localStorage.setItem(STORE_KEY, JSON.stringify(listings)); } catch (err) { /* ignore */ }
     markDirty();
+    autoPublish();
   }
 
   function markDirty() {
     var dirty = JSON.stringify(listings) !== JSON.stringify(PUBLISHED);
     var banner = byId('dirty');
     if (banner) banner.hidden = !dirty;
+  }
+
+  /* ---------- too many guesses ---------- */
+
+  /* הגנה על הכניסה: אחרי חמישה ניסיונות שגויים המסך ננעל לזמן שהולך וגדל,
+     וכל ניסיון לוקח זמן קבוע כך שגם ניחוש אוטומטי מתקדם לאט. הנעילה נשמרת
+     בדפדפן, ולכן היא מעכבת בעיקר ניסיון ידני; מול סקריפט מה שמגן באמת הוא
+     שאין דרך לשנות משהו באתר בלי מפתח הגישה, שאינו נמצא בקוד האתר.
+
+     Sign-in protection: five wrong guesses lock the screen for a growing
+     delay, and every attempt costs a fixed amount of time so automated
+     guessing crawls. The lock lives in the browser, so it mostly slows a
+     person down; against a script what protects the site is that nothing can
+     be changed without the access token, which is not in the site's code. */
+
+  var TRY_KEY = 'kertsman:admin:tries';
+  var LOCK_STEPS = [30, 60, 120, 300, 900, 1800];
+  var FREE_TRIES = 5;
+  var ATTEMPT_COST = 600;     // מילישניות לכל ניסיון / milliseconds per attempt
+  var lockTimer = null;
+
+  function readTries() {
+    try {
+      var raw = localStorage.getItem(TRY_KEY);
+      if (raw) {
+        var parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.n === 'number') return parsed;
+      }
+    } catch (err) { /* ignore */ }
+    return { n: 0, until: 0 };
+  }
+
+  function writeTries(value) {
+    try { localStorage.setItem(TRY_KEY, JSON.stringify(value)); } catch (err) { /* ignore */ }
+  }
+
+  function lockLeft() {
+    return Math.max(0, readTries().until - Date.now());
+  }
+
+  function clock(ms) {
+    var total = Math.ceil(ms / 1000);
+    var m = Math.floor(total / 60);
+    var s = total % 60;
+    return m ? m + ':' + (s < 10 ? '0' : '') + s + ' דקות' : total + ' שניות';
+  }
+
+  function showLock() {
+    var status = byId('gate-status');
+    var button = byId('gate-form').querySelector('button[type="submit"]');
+    var field = byId('gate-pass');
+    clearInterval(lockTimer);
+    var tick = function () {
+      var left = lockLeft();
+      if (left <= 0) {
+        clearInterval(lockTimer);
+        button.disabled = false;
+        field.disabled = false;
+        status.textContent = 'אפשר לנסות שוב.';
+        field.focus();
+        return;
+      }
+      button.disabled = true;
+      field.disabled = true;
+      status.textContent = 'יותר מדי ניסיונות. אפשר לנסות שוב בעוד ' + clock(left) + '.';
+    };
+    tick();
+    if (lockLeft() > 0) lockTimer = setInterval(tick, 1000);
+  }
+
+  function noteFail() {
+    var state = readTries();
+    state.n += 1;
+    if (state.n >= FREE_TRIES) {
+      var step = LOCK_STEPS[Math.min(state.n - FREE_TRIES, LOCK_STEPS.length - 1)];
+      state.until = Date.now() + step * 1000;
+    }
+    writeTries(state);
+    return state;
+  }
+
+  function noteOk() {
+    try { localStorage.removeItem(TRY_KEY); } catch (err) { /* ignore */ }
+    clearInterval(lockTimer);
   }
 
   /* ---------- the gate ---------- */
@@ -68,25 +153,49 @@
   function wireGate() {
     var form = byId('gate-form');
     var status = byId('gate-status');
+    var button = form.querySelector('button[type="submit"]');
+
     try {
       if (sessionStorage.getItem(UNLOCK_KEY) === '1') { unlock(); return; }
     } catch (err) { /* ignore */ }
 
+    if (lockLeft() > 0) showLock();
+
     form.addEventListener('submit', function (event) {
       event.preventDefault();
+      if (lockLeft() > 0) { showLock(); return; }
+
       var value = byId('gate-pass').value;
       if (!window.crypto || !crypto.subtle) {
         status.textContent = 'הדפדפן הזה לא תומך בבדיקת הסיסמה. נסו בדפדפן מעודכן.';
         return;
       }
+
+      button.disabled = true;
+      status.textContent = 'בודק...';
+      var started = Date.now();
+
       sha256(value).then(function (hash) {
-        if (hash === PASS_HASH) {
+        // כל ניסיון עולה אותו זמן, כך שאי אפשר ללמוד מהמהירות ואי אפשר לנחש מהר
+        var wait = Math.max(0, ATTEMPT_COST - (Date.now() - started));
+        return new Promise(function (resolve) {
+          setTimeout(function () { resolve(hash === PASS_HASH); }, wait);
+        });
+      }).then(function (good) {
+        button.disabled = false;
+        if (good) {
+          noteOk();
           try { sessionStorage.setItem(UNLOCK_KEY, '1'); } catch (err) { /* ignore */ }
+          status.textContent = '';
           unlock();
-        } else {
-          status.textContent = 'סיסמה שגויה. נסו שוב.';
-          byId('gate-pass').select();
+          return;
         }
+        var state = noteFail();
+        if (state.until > Date.now()) { showLock(); return; }
+        var left = FREE_TRIES - state.n;
+        var warn = left > 2 ? '' : (left === 1 ? ' נשאר ניסיון אחד לפני נעילה זמנית.' : ' נשארו ' + left + ' ניסיונות לפני נעילה זמנית.');
+        status.textContent = 'סיסמה שגויה.' + warn;
+        byId('gate-pass').select();
       });
     });
   }
@@ -101,6 +210,46 @@
   }
 
   var STATUS_LABEL = { available: 'למכירה', 'under-offer': 'בתהליך', sold: 'נמכרה' };
+
+  var TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M4 7h16M10 4h4M9 7v12M15 7v12M6 7l1 13h10l1-13"/></svg>';
+
+  /* חלון אישור במקום confirm של הדפדפן, כדי שהמחיקה תישאל באותה שפה ובאותו
+     עיצוב. אם הדפדפן ישן ולא תומך ב-dialog, חוזרים ל-confirm הרגיל.
+     A confirmation dialog in the site's own language and styling, falling back
+     to the browser's confirm on older browsers. */
+  function askDelete(name) {
+    var dialog = byId('ask');
+    var question = 'למחוק את ' + name + ' מהאתר?';
+    if (!dialog || typeof dialog.showModal !== 'function') {
+      return Promise.resolve(window.confirm(question));
+    }
+    byId('ask-text').textContent = 'הדירה "' + name + '" תוסר מהאתר. אי אפשר לבטל את הפעולה.';
+    return new Promise(function (resolve) {
+      var done = function () {
+        dialog.removeEventListener('close', done);
+        resolve(dialog.returnValue === 'ok');
+      };
+      dialog.addEventListener('close', done);
+      dialog.returnValue = 'cancel';
+      dialog.showModal();
+      byId('ask-ok').focus();
+    });
+  }
+
+  function removeAt(index) {
+    var item = listings[index];
+    if (!item) return;
+    askDelete(loc(item.title, 'he') || 'הדירה').then(function (yes) {
+      if (!yes) return;
+      listings.splice(index, 1);
+      if (editingIndex === index) { byId('editor').hidden = true; editingIndex = -1; }
+      else if (editingIndex > index) editingIndex -= 1;
+      save();
+      render();
+    });
+  }
 
   function blank() {
     return {
@@ -138,6 +287,7 @@
           '<button class="btn btn-ghost btn-sm" type="button" data-edit="' + index + '">עריכה</button>' +
           '<button class="icon-btn" type="button" data-up="' + index + '" aria-label="העלאה למעלה"' + (index === 0 ? ' disabled' : '') + '>&#8593;</button>' +
           '<button class="icon-btn" type="button" data-down="' + index + '" aria-label="הורדה למטה"' + (index === listings.length - 1 ? ' disabled' : '') + '>&#8595;</button>' +
+          '<button class="icon-btn danger" type="button" data-del="' + index + '" aria-label="מחיקת הדירה" title="מחיקת הדירה">' + TRASH + '</button>' +
         '</span>';
       rows.appendChild(li);
     });
@@ -263,13 +413,7 @@
     });
 
     byId('delete').addEventListener('click', function () {
-      if (editingIndex === -1) return;
-      var name = loc(listings[editingIndex].title, 'he') || 'הדירה';
-      if (!window.confirm('למחוק את ' + name + ' מהאתר?')) return;
-      listings.splice(editingIndex, 1);
-      save();
-      render();
-      byId('editor').hidden = true;
+      if (editingIndex !== -1) removeAt(editingIndex);
     });
 
     byId('rows').addEventListener('click', function (event) {
@@ -280,7 +424,10 @@
       if (up) { move(Number(up.getAttribute('data-up')), -1); return; }
 
       var down = event.target.closest('[data-down]');
-      if (down) { move(Number(down.getAttribute('data-down')), 1); }
+      if (down) { move(Number(down.getAttribute('data-down')), 1); return; }
+
+      var del = event.target.closest('[data-del]');
+      if (del) { removeAt(Number(del.getAttribute('data-del'))); }
     });
   }
 
@@ -782,7 +929,8 @@
       branch: saved.branch || 'main',
       prefix: saved.prefix || '',
       token: saved.token || '',
-      remember: saved.remember !== false
+      remember: saved.remember !== false,
+      auto: saved.auto !== false
     };
   }
 
@@ -812,7 +960,8 @@
       branch: (byId('c-branch').value || '').trim() || 'main',
       prefix: prefix,
       token: (byId('c-token').value || '').trim(),
-      remember: byId('c-remember').checked
+      remember: byId('c-remember').checked,
+      auto: byId('c-auto') ? byId('c-auto').checked : true
     };
   }
 
@@ -828,7 +977,13 @@
       init.headers['Content-Type'] = 'application/json';
       delete init.json;
     }
-    return fetch(GH_API + path, init).then(function (response) {
+    return fetch(GH_API + path, init).catch(function (err) {
+      // fetch נכשל עוד לפני שהגיעה תשובה: אין רשת, או שהדף חסום מלפנות החוצה
+      // (למשל בתוך תצוגה מקדימה). זה לא אותו דבר כמו תשובת שגיאה מ-GitHub.
+      var blocked = new Error(err && err.message ? err.message : 'network');
+      blocked.network = true;
+      throw blocked;
+    }).then(function (response) {
       if (response.status === 204) return {};
       return response.json().catch(function () { return {}; }).then(function (body) {
         if (response.ok) return body;
@@ -841,10 +996,17 @@
 
   function ghProblem(error) {
     var status = error && error.status;
-    if (status === 401) return 'מפתח הגישה אינו תקף או שפג תוקפו. צרו מפתח חדש והדביקו אותו כאן.';
-    if (status === 403) return 'למפתח אין הרשאת כתיבה. בדקו שההרשאה Contents מוגדרת ל-Read and write.';
-    if (status === 404) return 'לא נמצא מחסן בשם הזה, או שהמפתח לא מורשה עליו. בדקו את השם ואת שם הענף.';
-    if (status === 409) return 'הענף ריק או חסום. בדקו את שם הענף.';
+    var detail = error && error.message ? ' (' + error.message + ')' : '';
+    if (error && error.network) {
+      return 'הדפדפן לא הצליח לפנות ל-GitHub. זה קורה בתצוגה מקדימה שחוסמת פניות החוצה, ' +
+        'או כשאין אינטרנט. פתחו את מסך הניהול מכתובת האתר עצמה ונסו שוב.' + detail;
+    }
+    if (status === 401) return 'מפתח הגישה אינו תקף או שפג תוקפו. צרו מפתח חדש והדביקו אותו כאן.' + detail;
+    if (status === 403) return 'המפתח מזוהה אבל אין לו הרשאת כתיבה למחסן הזה. בדקו שהוא הונפק לחשבון שבבעלותו המחסן, ושההרשאה Contents מוגדרת ל-Read and write.' + detail;
+    if (status === 404) return 'לא נמצא מחסן בשם הזה, או שהמפתח לא מורשה עליו. בדקו את שם המחסן, את שם הענף, ושבחרתם את המחסן ברשימת Only select repositories.' + detail;
+    if (status === 409) return 'הענף ריק או חסום. בדקו את שם הענף.' + detail;
+    if (status === 422) return 'GitHub דחה את העדכון' + detail;
+    if (status) return 'GitHub החזיר שגיאה ' + status + detail;
     if (error && error.message) return 'GitHub החזיר שגיאה: ' + error.message;
     return 'לא הצלחנו להתחבר. בדקו את חיבור האינטרנט ונסו שוב.';
   }
@@ -886,6 +1048,8 @@
     byId('c-prefix').value = saved.prefix;
     byId('c-token').value = saved.token;
     byId('c-remember').checked = saved.remember;
+    byId('c-auto').checked = saved.auto;
+    byId('c-auto').addEventListener('change', function () { ghWrite(ghFields()); });
     if (saved.token) ghSay('connect-status', 'מפתח גישה שמור בדפדפן הזה. אפשר לפרסם.', 'ok');
 
     byId('c-save').addEventListener('click', function () {
@@ -902,9 +1066,14 @@
       var settings = ghFields();
       if (!settings.token) { ghSay('connect-status', 'הדביקו קודם מפתח גישה.', 'err'); return; }
       ghSay('connect-status', 'בודק את החיבור...');
-      ghCall(settings, '/repos/' + settings.repo).then(function (repo) {
+      var who = '';
+      ghCall(settings, '/user').catch(function () { return {}; }).then(function (user) {
+        who = user && user.login ? ' המפתח שייך לחשבון ' + user.login + '.' : '';
+        return ghCall(settings, '/repos/' + settings.repo);
+      }).then(function (repo) {
         if (repo.permissions && repo.permissions.push === false) {
-          ghSay('connect-status', 'המפתח קורא את ' + repo.full_name + ' אבל אינו יכול לכתוב אליו. הגדירו Contents: Read and write.', 'err');
+          ghSay('connect-status', 'המפתח קורא את ' + repo.full_name + ' אבל אינו יכול לכתוב אליו.' + who +
+            ' בדף המפתח ב-GitHub, תחת Repository permissions, הגדירו Contents: Read and write.', 'err');
           return;
         }
         return ghCall(settings, '/repos/' + settings.repo + '/git/ref/heads/' + encodeURIComponent(settings.branch)).then(function () {
@@ -912,7 +1081,7 @@
           ghSay('connect-status', 'החיבור עובד. ' + repo.full_name + ', ענף ' + settings.branch + '. אפשר לפרסם.', 'ok');
         });
       }).catch(function (error) {
-        ghSay('connect-status', ghProblem(error), 'err');
+        ghSay('connect-status', ghProblem(error) + who, 'err');
       });
     });
 
@@ -924,88 +1093,129 @@
     });
   }
 
+  /* שמירה = פרסום. כל שינוי ברשימה מפעיל העלאה לאתר, עם השהיה קצרה כדי
+     ששינויים רצופים ייכתבו בפעם אחת, ועם תור למקרה ששינוי נוסף מגיע באמצע.
+     Saving is publishing: every change to the list triggers an upload, with a
+     short delay so consecutive edits go up as one, and a queue in case another
+     edit lands mid-flight. */
+
+  var publishTimer = null;
+  var publishing = false;
+  var publishQueued = false;
+
+  function autoPublish() {
+    var box = byId('c-auto');
+    if (!box || !box.checked) return;
+    var settings = ghFields();
+    if (!settings.token || !settings.repo) {
+      ghSay('publish-status', 'השינוי נשמר בדפדפן. כדי שיעלה לאתר אוטומטית, הדביקו מפתח גישה בקטע "חיבור לאתר" שבתחתית המסך.');
+      return;
+    }
+    clearTimeout(publishTimer);
+    ghSay('publish-status', 'נשמר. מעלה לאתר...');
+    publishTimer = setTimeout(publishNow, 1200);
+  }
+
+  function publishNow() {
+    clearTimeout(publishTimer);
+    var settings = ghFields();
+    if (!settings.token || !settings.repo) return;
+    if (publishing) { publishQueued = true; return; }
+
+    var button = byId('publish');
+    var label = button ? button.textContent : '';
+    var fresh = usedPending();
+    var paths = Object.keys(fresh).filter(function (path) { return !uploaded[path]; });
+    var snapshot = JSON.parse(JSON.stringify(listings));
+    var text = serialise();
+
+    publishing = true;
+    if (button) button.disabled = true;
+
+    var finish = function () {
+      publishing = false;
+      if (button) { button.disabled = false; button.textContent = label; }
+      if (publishQueued) { publishQueued = false; setTimeout(publishNow, 300); }
+    };
+
+    ghSay('publish-status', paths.length ? 'מעלה לאתר...' : 'מעלה את השינוי לאתר...');
+
+    var entries = [];
+    var chain = Promise.resolve();
+    paths.forEach(function (path, index) {
+      chain = chain.then(function () {
+        var step = 'מעלה תמונה ' + (index + 1) + ' מתוך ' + paths.length + '...';
+        if (button) button.textContent = step;
+        ghSay('publish-status', step);
+        return base64(fresh[path].blob).then(function (content) {
+          return ghCall(settings, '/repos/' + settings.repo + '/git/blobs', {
+            method: 'POST', json: { content: content, encoding: 'base64' }
+          });
+        }).then(function (blob) {
+          entries.push({ path: settings.prefix + path, mode: '100644', type: 'blob', sha: blob.sha });
+        });
+      });
+    });
+
+    chain
+      .then(function () {
+        if (button) button.textContent = 'מפרסם...';
+        ghSay('publish-status', 'כותב את רשימת הדירות...');
+        entries.push({
+          path: settings.prefix + 'data/listings.js',
+          mode: '100644', type: 'blob', content: text
+        });
+        return commitTree(settings, entries, 'עדכון הדירות ממסך הניהול (' + snapshot.length + ' דירות)');
+      })
+      .then(function () {
+        paths.forEach(function (path) { uploaded[path] = true; });
+        PUBLISHED = snapshot;
+        markDirty();
+        finish();
+        var shots = paths.length === 0 ? '' : (paths.length === 1 ? ', כולל תמונה אחת' : ', כולל ' + paths.length + ' תמונות');
+        ghSay('publish-status', 'נשמר ופורסם לאתר' + shots + '. השינוי יופיע באתר בתוך דקה בערך.', 'ok');
+      })
+      .catch(function (error) {
+        finish();
+        ghSay('publish-status', ghProblem(error) + ' השינוי שמור בדפדפן. אפשר לנסות שוב בכפתור "פרסום לאתר".', 'err');
+      });
+  }
+
+  /* כתיבת קבוצת קבצים ב-commit אחד. משמש גם לפרסום הדירות וגם לשמירת
+     המפתח המוצפן. / Writes a set of files as one commit: used both for the
+     listings and for the encrypted key. */
+  function commitTree(settings, entries, message) {
+    var ref;
+    return ghCall(settings, '/repos/' + settings.repo + '/git/ref/heads/' + encodeURIComponent(settings.branch))
+      .then(function (data) {
+        ref = data.object.sha;
+        return ghCall(settings, '/repos/' + settings.repo + '/git/commits/' + ref);
+      })
+      .then(function (commit) {
+        return ghCall(settings, '/repos/' + settings.repo + '/git/trees', {
+          method: 'POST', json: { base_tree: commit.tree.sha, tree: entries }
+        });
+      })
+      .then(function (tree) {
+        return ghCall(settings, '/repos/' + settings.repo + '/git/commits', {
+          method: 'POST', json: { message: message, tree: tree.sha, parents: [ref] }
+        });
+      })
+      .then(function (commit) {
+        return ghCall(settings, '/repos/' + settings.repo + '/git/refs/heads/' + encodeURIComponent(settings.branch), {
+          method: 'PATCH', json: { sha: commit.sha }
+        });
+      });
+  }
+
   function wirePublish() {
     var button = byId('publish');
     if (!button) return;
-
     button.addEventListener('click', function () {
       var settings = ghFields();
       if (needsToken(settings)) return;
       ghWrite(settings);
-
-      var fresh = usedPending();
-      var paths = Object.keys(fresh).filter(function (path) { return !uploaded[path]; });
-      var label = button.textContent;
-      var ref, baseTree;
-
-      button.disabled = true;
-      ghSay('publish-status', 'מתחבר לאתר...');
-
-      ghCall(settings, '/repos/' + settings.repo + '/git/ref/heads/' + encodeURIComponent(settings.branch))
-        .then(function (data) {
-          ref = data.object.sha;
-          return ghCall(settings, '/repos/' + settings.repo + '/git/commits/' + ref);
-        })
-        .then(function (commit) {
-          baseTree = commit.tree.sha;
-          var entries = [];
-          var chain = Promise.resolve();
-          paths.forEach(function (path, index) {
-            chain = chain.then(function () {
-              var step = 'מעלה תמונה ' + (index + 1) + ' מתוך ' + paths.length + '...';
-              button.textContent = step;
-              ghSay('publish-status', step);
-              return base64(fresh[path].blob).then(function (content) {
-                return ghCall(settings, '/repos/' + settings.repo + '/git/blobs', {
-                  method: 'POST', json: { content: content, encoding: 'base64' }
-                });
-              }).then(function (blob) {
-                entries.push({ path: settings.prefix + path, mode: '100644', type: 'blob', sha: blob.sha });
-              });
-            });
-          });
-          return chain.then(function () { return entries; });
-        })
-        .then(function (entries) {
-          button.textContent = 'מפרסם...';
-          ghSay('publish-status', 'כותב את רשימת הדירות...');
-          entries.push({
-            path: settings.prefix + 'data/listings.js',
-            mode: '100644', type: 'blob', content: serialise()
-          });
-          return ghCall(settings, '/repos/' + settings.repo + '/git/trees', {
-            method: 'POST', json: { base_tree: baseTree, tree: entries }
-          });
-        })
-        .then(function (tree) {
-          return ghCall(settings, '/repos/' + settings.repo + '/git/commits', {
-            method: 'POST',
-            json: {
-              message: 'עדכון הדירות ממסך הניהול (' + listings.length + ' דירות)',
-              tree: tree.sha,
-              parents: [ref]
-            }
-          });
-        })
-        .then(function (commit) {
-          return ghCall(settings, '/repos/' + settings.repo + '/git/refs/heads/' + encodeURIComponent(settings.branch), {
-            method: 'PATCH', json: { sha: commit.sha }
-          });
-        })
-        .then(function () {
-          paths.forEach(function (path) { uploaded[path] = true; });
-          PUBLISHED = JSON.parse(JSON.stringify(listings));
-          markDirty();
-          button.textContent = label;
-          button.disabled = false;
-          var shots = paths.length === 0 ? '' : (paths.length === 1 ? ', כולל תמונה אחת' : ', כולל ' + paths.length + ' תמונות');
-          ghSay('publish-status', 'פורסם לאתר' + shots + '. השינויים יופיעו באתר בתוך דקה בערך, אחרי רענון הדף.', 'ok');
-        })
-        .catch(function (error) {
-          button.textContent = label;
-          button.disabled = false;
-          ghSay('publish-status', ghProblem(error) + ' אם זה נמשך, אפשר להוריד את העדכון ולהעלות אותו ידנית.', 'err');
-        });
+      publishNow();
     });
   }
 
