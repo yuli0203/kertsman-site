@@ -20,7 +20,6 @@ window.KERTSMAN_CONFIG = {
   phoneIntl: "972522275710",
   email: "shimon@kertsman.com",
   formKey: "a8c5c702-7296-445c-89d8-9ed277d3c68b",
-  recoveryEmail: "ora0203@gmail.com",
   officeCity: {
     he: "חיפה",
     ru: "Хайфа"

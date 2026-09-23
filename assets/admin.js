@@ -791,7 +791,8 @@
   }
 
   function serialise() {
-    var config = window.KERTSMAN_CONFIG || {};
+    var config = Object.assign({}, window.KERTSMAN_CONFIG || {});
+    delete config.recoveryEmail; // private: never published in the public data file
     var out = [];
     out.push('/* ============================================================================');
     out.push('   קרצמן נדל"ן — קובץ הנכסים / Kertsman Real Estate — property data');
