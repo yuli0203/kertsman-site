@@ -972,8 +972,6 @@
     if (back) back.addEventListener('click', function () { show(false); });
 
     var config = window.KERTSMAN_CONFIG || {};
-    var emailField = byId('rec-email');
-    if (emailField && config.recoveryEmail) emailField.value = config.recoveryEmail;
 
     form.addEventListener('submit', function (event) {
       event.preventDefault();
